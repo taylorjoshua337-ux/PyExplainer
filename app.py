@@ -3,7 +3,7 @@ import ast
 import traceback
 import sys
 import io
-import requests
+from google import genai
 
 # Page Configuration
 st.set_page_config(
@@ -101,6 +101,41 @@ st.sidebar.info(
 )
 
 # ------------------------------------------------------------------------------
+# AI Gemini Client Helper
+# ------------------------------------------------------------------------------
+@st.cache_resource
+def get_gemini_client():
+    api_key = st.secrets.get("GEMINI_API_KEY", None)
+    if not api_key:
+        return None
+    return genai.Client(api_key=api_key)
+
+def query_gemini_tutor(prompt, code_context):
+    client = get_gemini_client()
+    if not client:
+        return "⚠️ Missing API Key! Add `GEMINI_API_KEY` to your Streamlit secrets."
+    
+    system_instruction = (
+        "You are PyExplain AI, an encouraging and expert Python tutor for beginners.\n"
+        "Explain errors simply, use analogies, and provide refactored code blocks."
+    )
+    
+    full_prompt = (
+        f"{system_instruction}\n\n"
+        f"--- CURRENT CODE & ANALYSIS ---\n{code_context}\n\n"
+        f"--- USER QUESTION ---\n{prompt}"
+    )
+    
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=full_prompt,
+        )
+        return response.text
+    except Exception as e:
+        return f"⚠️ Error querying Gemini API: {e}"
+
+# ------------------------------------------------------------------------------
 # Helper Functions
 # ------------------------------------------------------------------------------
 def get_syntax_error_details(msg):
@@ -109,37 +144,37 @@ def get_syntax_error_details(msg):
     
     if "expected 'except' or 'finally'" in msg_lower or "expected an indented block after 'try'" in msg_lower:
         return {
-            "explanation": "You opened a `try:` block, but every `try:` block in Python MUST be immediately followed by at least one `except:` or `finally:` block. Python needs to know what code to execute if an error occurs inside the `try:` block.",
+            "explanation": "You opened a `try:` block, but every `try:` block in Python MUST be immediately followed by at least one `except:` or `finally:` block.",
             "analogy": "🚪 **Analogy:** Starting a sentence with 'If something goes wrong...' but forgetting to write what to do when it actually goes wrong.",
             "before": "try:\n    total = sum(numbers)\n    return total / len(numbers)\n\n# Missing except or finally block!",
             "after": "try:\n    total = sum(numbers)\n    return total / len(numbers)\nexcept ZeroDivisionError:\n    return 0.0"
         }
     elif "expected ':'" in msg_lower:
         return {
-            "explanation": "Python statement headers (like `if`, `def`, `for`, `while`, `try`, `except`) require a colon `:` at the end of the header line to start a code block.",
-            "analogy": "✍️ **Analogy:** Forgetting a period or punctuation mark at the end of a sentence header.",
+            "explanation": "Python statement headers require a colon `:` at the end of the header line to start a code block.",
+            "analogy": "✍️ **Analogy:** Forgetting a punctuation mark at the end of a sentence header.",
             "before": "def calculate_average(numbers)",
             "after": "def calculate_average(numbers):"
         }
     elif "was never closed" in msg_lower or "unmatched" in msg_lower or "closing parenthesis" in msg_lower:
         return {
-            "explanation": "A parenthesis `()`, bracket `[]`, or brace `{}` was opened but missing its closing pair on or before this line.",
+            "explanation": "A parenthesis `()`, bracket `[]`, or brace `{}` was opened but missing its closing pair.",
             "analogy": "📦 **Analogy:** Opening a box to place items inside, but forgetting to tape it shut.",
             "before": "print(calculate_average(6)",
             "after": "print(calculate_average(6))"
         }
     elif "indented block" in msg_lower:
         return {
-            "explanation": "Python relies on indentation (usually 4 spaces) to define code blocks. The code directly following a colon `:` must be indented.",
+            "explanation": "Python relies on indentation to define code blocks. The code directly following a colon `:` must be indented.",
             "analogy": "📐 **Analogy:** Writing sub-bullet points without indenting them under their main header.",
             "before": "def greet():\nprint('Hello')",
             "after": "def greet():\n    print('Hello')"
         }
     else:
         return {
-            "explanation": f"Python encountered invalid syntax: `{msg}`. This line breaks Python's grammatical parsing rules.",
-            "analogy": "🚨 **Analogy:** Using invalid sentence structure that prevents the reader from understanding the statement.",
-            "before": "# Review the line for typos, unexpected symbols, or unclosed string quotes",
+            "explanation": f"Python encountered invalid syntax: `{msg}`.",
+            "analogy": "🚨 **Analogy:** Using invalid sentence structure that prevents reading comprehension.",
+            "before": "# Review the line for typos or unclosed quotes",
             "after": "# Ensure clean syntax and matching colons/brackets"
         }
 
@@ -161,19 +196,16 @@ def analyze_ast_flaws(code_str):
         }], None
 
     for node in ast.walk(tree):
-        # 1. Detect bare except / silent error suppression
         if isinstance(node, ast.ExceptHandler) and node.type is None:
             flaws.append({
                 "type": "Silent Error Suppression",
                 "line": node.lineno,
                 "message": "Using `except:` (or `except: pass`) silently hides bugs.",
-                "explanation": "Your code experienced an internal error, but `except:` hid the error and returned `None` instead of fixing the underlying problem.",
-                "analogy": "🙈 **Analogy:** Silencing a fire alarm when you smell smoke instead of putting out the fire.",
+                "explanation": "Your code experienced an internal error, but `except:` hid the error.",
+                "analogy": "🙈 **Analogy:** Silencing a fire alarm when you smell smoke.",
                 "before": "except:\n    pass",
-                "after": "except ZeroDivisionError:\n    return 0.0  # Explicit error handling"
+                "after": "except ZeroDivisionError:\n    return 0.0"
             })
-        
-        # 2. Detect range(len(...)) loop anti-pattern
         elif isinstance(node, ast.For) and isinstance(node.iter, ast.Call):
             func = getattr(node.iter.func, 'id', None)
             if func == 'range' and len(node.iter.args) == 1:
@@ -183,41 +215,19 @@ def analyze_ast_flaws(code_str):
                         "type": "Non-Pythonic Loop",
                         "line": node.lineno,
                         "message": "Unnecessary `for i in range(len(...))` pattern.",
-                        "explanation": "Iterating over index ranges manually is less readable and slower than direct element iteration in Python.",
-                        "analogy": "📋 **Analogy:** Looking up page numbers in an index to read a book page-by-page, instead of just reading the pages directly.",
+                        "explanation": "Iterating over index ranges manually is less readable than direct iteration.",
+                        "analogy": "📋 **Analogy:** Looking up page numbers in an index to read a book page-by-page.",
                         "before": "for i in range(len(items)):\n    print(items[i])",
                         "after": "for item in items:\n    print(item)"
                     })
 
     return flaws, tree
 
-def query_local_ollama(prompt, code_context):
-    """Sends user prompt and code context to local Ollama server."""
-    full_prompt = (
-        f"You are PyExplain AI, a friendly Python coding tutor for beginners.\n\n"
-        f"--- CODE CONTEXT ---\n{code_context}\n\n"
-        f"--- USER QUESTION ---\n{prompt}\n\n"
-        f"Provide a clear, helpful explanation with code examples where relevant:"
-    )
-    try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "qwen2.5-coder",
-                "prompt": full_prompt,
-                "stream": False
-            },
-            timeout=30
-        )
-        return response.json().get("response", "No response received from local Ollama.")
-    except Exception as e:
-        return f"⚠️ Could not connect to local Ollama. Ensure `ollama run qwen2.5-coder` is running in your terminal. Error: {e}"
-
 # ------------------------------------------------------------------------------
 # Main UI Layout
 # ------------------------------------------------------------------------------
 st.title("🐍 PyExplain: Python Error & Flaw Explainer")
-st.write("Analyze code structure, catch static anti-patterns, and chat with a local AI tutor.")
+st.write("Analyze code structure, catch static anti-patterns, and chat with an AI tutor.")
 
 code_input = st.text_area(
     "Source Code:", 
@@ -231,12 +241,10 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
     with st.spinner("Analyzing AST structure and running sandbox..."):
         ast_flaws, parsed_tree = analyze_ast_flaws(code_input)
         
-        # Sandbox Execution
         output_buffer = io.StringIO()
         sys.stdout = output_buffer
         runtime_error = None
         
-        # Skip execution if Syntax Error exists
         if not (ast_flaws and ast_flaws[0]["type"] == "Syntax Error"):
             try:
                 execution_scope = {}
@@ -251,7 +259,7 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
                 runtime_fixes = {
                     "ZeroDivisionError": (
                         "Attempted to divide a number by zero (`0`).",
-                        "🍫 **Analogy:** Trying to divide 10 cookies among 0 friends. You cannot split something into zero groups.",
+                        "🍫 **Analogy:** Trying to divide 10 cookies among 0 friends.",
                         "if denominator == 0:\n    return 0\nreturn numerator / denominator"
                     ),
                     "IndexError": (
@@ -261,12 +269,12 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
                     ),
                     "KeyError": (
                         "Attempted to access a dictionary key that does not exist.",
-                        "🔑 **Analogy:** Looking inside a labeled locker for a key tag that was never placed there.",
+                        "🔑 **Analogy:** Looking inside a locker for a key tag that was never placed there.",
                         "value = my_dict.get('key', 'default_value')"
                     ),
                     "TypeError": (
                         "Operation attempted on incompatible data types.",
-                        "🍎 **Analogy:** Trying to multiply a number by an apple (combining incompatible types).",
+                        "🍎 **Analogy:** Trying to multiply a number by an apple.",
                         "result = str(number) + text"
                     )
                 }
@@ -288,14 +296,10 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
     st.toast("Analysis completed!", icon="✅")
     st.divider()
 
-    # --------------------------------------------------------------------------
-    # 1. Top Metrics Summary Row
-    # --------------------------------------------------------------------------
     has_syntax_err = ast_flaws and ast_flaws[0]["type"] == "Syntax Error"
     num_ast_flaws = len(ast_flaws) if ast_flaws else 0
     
     col_m1, col_m2, col_m3 = st.columns(3)
-    
     with col_m1:
         st.metric("Static AST Flaws", f"{num_ast_flaws} Found" if not has_syntax_err else "Syntax Error")
     with col_m2:
@@ -310,21 +314,16 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
 
     st.divider()
 
-    # --------------------------------------------------------------------------
-    # 2. Main Output Tabs
-    # --------------------------------------------------------------------------
     tab_out, tab_ast, tab_runtime, tab_ai = st.tabs([
         "🚀 Console Output", 
         "⚠️ AST Code Analysis", 
         "💥 Runtime Debugger",
-        "🤖 Local AI Tutor"
+        "🤖 AI Tutor (Cloud)"
     ])
 
-    # --- TAB 1: Console Output ---
     with tab_out:
         st.subheader("Execution Output")
         out_text = output_buffer.getvalue()
-        
         if has_syntax_err:
             st.error("Syntax Error detected. Code execution was safely blocked.")
         elif runtime_error:
@@ -334,16 +333,13 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
             st.success("Execution completed without runtime crashes.")
             st.text_area("Output Log:", out_text if out_text else "[Code executed successfully with no print output]", height=160)
 
-    # --- TAB 2: AST Static Analysis ---
     with tab_ast:
         st.subheader("Static Code Quality & Anti-Patterns")
-        
         if not ast_flaws:
             st.success("🎉 Excellent! No static code anti-patterns or syntax errors detected.")
         else:
             for flaw in ast_flaws:
                 line_str = code_lines[flaw['line'] - 1].strip() if flaw.get('line') and flaw['line'] <= len(code_lines) else ""
-                
                 st.markdown(f"""
                 <div class="flaw-card">
                     <span class="line-badge">Line {flaw['line']}</span> <strong>{flaw['type']}:</strong> <code>{line_str}</code>
@@ -364,18 +360,13 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
                         with c2:
                             st.caption("✅ Recommended Fix")
                             st.code(flaw['after'], language="python")
-                    elif flaw.get('fix'):
-                        st.success(f"💡 **Fix Suggestion:** {flaw['fix']}")
 
-    # --- TAB 3: Runtime Debugger ---
     with tab_runtime:
         st.subheader("Runtime Exception Analysis")
-        
         if not runtime_error:
             st.info("No runtime crashes recorded during execution.")
         else:
             err_line_str = code_lines[runtime_error['line'] - 1].strip() if isinstance(runtime_error['line'], int) and runtime_error['line'] <= len(code_lines) else ""
-            
             st.markdown(f"""
             <div class="crash-card">
                 <span class="line-badge">Line {runtime_error['line']}</span> <strong>{runtime_error['type']}:</strong> <code>{err_line_str}</code>
@@ -385,18 +376,16 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
             
             st.write(f"**Why it crashed:** {runtime_error['explanation']}")
             st.info(runtime_error['analogy'])
-            
             st.caption("✅ Suggested Code Fix")
             st.code(runtime_error['fix'], language="python")
 
-    # --- TAB 4: Local AI Tutor ---
     with tab_ai:
-        st.subheader("🤖 Local AI Code Assistant")
-        st.caption("Powered offline by local Ollama (`qwen2.5-coder`) — No API key required.")
+        st.subheader("🤖 Cloud AI Code Assistant")
+        st.caption("Powered 24/7 by Gemini 2.5 Flash API.")
 
         if "ai_messages" not in st.session_state:
             st.session_state.ai_messages = [
-                {"role": "assistant", "content": "👋 Hi! I can see your current code and error analysis. Ask me how to fix bugs, refactor loops, or explain Python concepts!"}
+                {"role": "assistant", "content": "👋 Hi! Ask me how to fix bugs, refactor loops, or explain Python concepts!"}
             ]
 
         for msg in st.session_state.ai_messages:
@@ -411,7 +400,7 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
             context_str = f"Code:\n{code_input}\n\nAST Flaws:\n{ast_flaws}\n\nRuntime Crash:\n{runtime_error}"
 
             with st.chat_message("assistant"):
-                with st.spinner("qwen2.5-coder thinking locally..."):
-                    reply = query_local_ollama(user_input, context_str)
+                with st.spinner("Gemini thinking..."):
+                    reply = query_gemini_tutor(user_input, context_str)
                     st.write(reply)
                     st.session_state.ai_messages.append({"role": "assistant", "content": reply})
