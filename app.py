@@ -15,12 +15,9 @@ st.set_page_config(
 # Custom CSS for UI Polish & Card Styling
 st.markdown("""
 <style>
-    /* Dark Theme Accent Polish */
     .stApp {
         background-color: #0e1117;
     }
-    
-    /* Custom Flaw & Crash Containers */
     .flaw-card {
         background-color: #1e222d;
         border-left: 5px solid #ffa726;
@@ -55,6 +52,14 @@ st.sidebar.title("⚙️ Presets & Guidance")
 st.sidebar.write("Load a pre-configured code sample to test different analyzer features:")
 
 presets = {
+    "Unclosed Try Block (Syntax Error)": """def calculate_average(numbers):
+    try:
+        total = sum(numbers)
+        return total / len(numbers)
+
+# Missing except or finally block!
+print(calculate_average([10, 20]))""",
+
     "Non-Pythonic Loop & Silent Bug": """def calculate_average(numbers):
     try:
         total = 0
@@ -79,10 +84,6 @@ print(divide_budget(100, 0))""",
 for i in range(5):
     print(items[i])""",
 
-    "Syntax Error": """def check_score(score)
-    if score > 50
-        print("Pass")""",
-
     "Clean Pythonic Code": """def calculate_average(numbers):
     if not numbers:
         return 0.0
@@ -99,6 +100,49 @@ st.sidebar.info(
 )
 
 # ------------------------------------------------------------------------------
+# Helper: Detailed Syntax Error Parser
+# ------------------------------------------------------------------------------
+def get_syntax_error_details(msg):
+    """Maps Python SyntaxError messages to detailed explanations and code solutions."""
+    msg_lower = msg.lower()
+    
+    if "expected 'except' or 'finally'" in msg_lower or "expected an indented block after 'try'" in msg_lower:
+        return {
+            "explanation": "You opened a `try:` block, but every `try:` block in Python MUST be immediately followed by at least one `except:` or `finally:` block. Python needs to know what code to execute if an error occurs inside the `try:` block.",
+            "analogy": "🚪 **Analogy:** Starting a sentence with 'If something goes wrong...' but forgetting to write what to do when it actually goes wrong.",
+            "before": "try:\n    total = sum(numbers)\n    return total / len(numbers)\n\n# Missing except or finally block!",
+            "after": "try:\n    total = sum(numbers)\n    return total / len(numbers)\nexcept ZeroDivisionError:\n    return 0.0"
+        }
+    elif "expected ':'" in msg_lower:
+        return {
+            "explanation": "Python statement headers (like `if`, `def`, `for`, `while`, `try`, `except`) require a colon `:` at the end of the line to start a code block.",
+            "analogy": "✍️ **Analogy:** Forgetting a punctuation mark at the end of a sentence header.",
+            "before": "def calculate_average(numbers)",
+            "after": "def calculate_average(numbers):"
+        }
+    elif "was never closed" in msg_lower or "unmatched" in msg_lower or "closing parenthesis" in msg_lower:
+        return {
+            "explanation": "A parenthesis `()`, bracket `[]`, or brace `{}` was opened but missing its closing pair on or before this line.",
+            "analogy": "📦 **Analogy:** Opening a box to place items inside, but forgetting to tape it shut.",
+            "before": "print(calculate_average(6)",
+            "after": "print(calculate_average(6))"
+        }
+    elif "indented block" in msg_lower:
+        return {
+            "explanation": "Python relies on indentation (usually 4 spaces) to define code blocks. The code directly following a colon `:` must be indented.",
+            "analogy": "📐 **Analogy:** Writing sub-bullet points without indenting them under their main header.",
+            "before": "def greet():\nprint('Hello')",
+            "after": "def greet():\n    print('Hello')"
+        }
+    else:
+        return {
+            "explanation": f"Python encountered invalid syntax: `{msg}`. This line breaks Python's grammatical parsing rules.",
+            "analogy": "🚨 **Analogy:** Using invalid sentence structure that prevents the reader from understanding the statement.",
+            "before": "# Review the line for typos, unexpected symbols, or unclosed string quotes",
+            "after": "# Ensure clean syntax and matching colons/brackets"
+        }
+
+# ------------------------------------------------------------------------------
 # Core Analysis Engine
 # ------------------------------------------------------------------------------
 def analyze_ast_flaws(code_str):
@@ -107,13 +151,15 @@ def analyze_ast_flaws(code_str):
     try:
         tree = ast.parse(code_str)
     except SyntaxError as e:
+        details = get_syntax_error_details(e.msg)
         return [{
             "type": "Syntax Error",
             "line": e.lineno,
             "message": e.msg,
-            "explanation": "Python cannot parse this code grammatically because it breaks language syntax rules.",
-            "analogy": "🚨 **Analogy:** Like ending a sentence mid-word without punctuation.",
-            "fix": "Check for missing colons (`:`), unmatched brackets, or typos near this line."
+            "explanation": details["explanation"],
+            "analogy": details["analogy"],
+            "before": details["before"],
+            "after": details["after"]
         }], None
 
     for node in ast.walk(tree):
@@ -225,8 +271,8 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
     # --------------------------------------------------------------------------
     # 1. Top Metrics Summary Row
     # --------------------------------------------------------------------------
-    num_ast_flaws = len(ast_flaws) if ast_flaws else 0
     has_syntax_err = ast_flaws and ast_flaws[0]["type"] == "Syntax Error"
+    num_ast_flaws = len(ast_flaws) if ast_flaws else 0
     
     col_m1, col_m2, col_m3 = st.columns(3)
     
@@ -235,12 +281,12 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
     with col_m2:
         st.metric("Runtime Status", "💥 Crashed" if runtime_error else ("❌ Syntax Blocked" if has_syntax_err else "✅ Passed"))
     with col_m3:
-        if not ast_flaws and not runtime_error:
-            st.metric("Code Health Grade", "A+ (Clean)")
-        elif num_ast_flaws > 0 and not runtime_error:
+        if has_syntax_err or runtime_error:
+            st.metric("Code Health Grade", "F (Fix Required)")
+        elif num_ast_flaws > 0:
             st.metric("Code Health Grade", "B (Refactor Needed)")
         else:
-            st.metric("Code Health Grade", "F (Fix Required)")
+            st.metric("Code Health Grade", "A+ (Clean)")
 
     st.divider()
 
@@ -288,10 +334,10 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
                     if flaw.get('before') and flaw.get('after'):
                         c1, c2 = st.columns(2)
                         with c1:
-                            st.caption("❌ Avoid (Current)")
+                            st.caption("❌ Avoid (Current Code)")
                             st.code(flaw['before'], language="python")
                         with c2:
-                            st.caption("✅ Recommended (Pythonic)")
+                            st.caption("✅ Recommended Fix")
                             st.code(flaw['after'], language="python")
                     elif flaw.get('fix'):
                         st.success(f"💡 **Fix Suggestion:** {flaw['fix']}")
