@@ -4,16 +4,58 @@ import traceback
 import sys
 import io
 
-st.set_page_config(page_title="PyExplain - Code Flaw Finder", layout="wide")
+# Page Configuration
+st.set_page_config(
+    page_title="PyExplain - Python Flaw & Error Explainer",
+    page_icon="🐍",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-st.title("🐍 PyExplain: Python Error & Flaw Explainer")
-st.write("Paste your Python code below to analyze static AST flaws, catch runtime errors, and view suggested fixes.")
+# Custom CSS for UI Polish & Card Styling
+st.markdown("""
+<style>
+    /* Dark Theme Accent Polish */
+    .stApp {
+        background-color: #0e1117;
+    }
+    
+    /* Custom Flaw & Crash Containers */
+    .flaw-card {
+        background-color: #1e222d;
+        border-left: 5px solid #ffa726;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 16px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+    }
+    .crash-card {
+        background-color: #2a1b20;
+        border-left: 5px solid #ef5350;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 16px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2);
+    }
+    .line-badge {
+        background-color: #2c3240;
+        color: #64b5f6;
+        padding: 4px 10px;
+        border-radius: 4px;
+        font-family: monospace;
+        font-size: 0.9em;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Sample input containing both an AST anti-pattern (range(len)) and a runtime error (ZeroDivisionError)
-code_input = st.text_area(
-    "Source Code:", 
-    height=260, 
-    value="""def calculate_average(numbers):
+# ------------------------------------------------------------------------------
+# Sidebar: Code Presets & Info
+# ------------------------------------------------------------------------------
+st.sidebar.title("⚙️ Presets & Guidance")
+st.sidebar.write("Load a pre-configured code sample to test different analyzer features:")
+
+presets = {
+    "Non-Pythonic Loop & Silent Bug": """def calculate_average(numbers):
     try:
         total = 0
         for i in range(len(numbers)):
@@ -23,9 +65,42 @@ code_input = st.text_area(
         pass
 
 # Test with an empty list
-print(calculate_average([]))"""
+print(calculate_average([]))""",
+
+    "Runtime Crash (ZeroDivisionError)": """def divide_budget(amount, people):
+    return amount / people
+
+# Test dividing by 0
+print(divide_budget(100, 0))""",
+
+    "Runtime Crash (IndexError)": """items = ["apple", "banana", "cherry"]
+
+# Loop goes past array bounds
+for i in range(5):
+    print(items[i])""",
+
+    "Syntax Error": """def check_score(score)
+    if score > 50
+        print("Pass")""",
+
+    "Clean Pythonic Code": """def calculate_average(numbers):
+    if not numbers:
+        return 0.0
+    return sum(numbers) / len(numbers)
+
+print(f"Average: {calculate_average([10, 20, 30])}")"""
+}
+
+selected_preset = st.sidebar.selectbox("Choose Code Example:", list(presets.keys()))
+st.sidebar.divider()
+st.sidebar.info(
+    "💡 **Tip:** PyExplain uses static Abstract Syntax Trees (AST) to catch bad coding habits "
+    "before running your code safely in a sandbox environment."
 )
 
+# ------------------------------------------------------------------------------
+# Core Analysis Engine
+# ------------------------------------------------------------------------------
 def analyze_ast_flaws(code_str):
     """Performs static analysis using Python AST to catch syntax errors and anti-patterns."""
     flaws = []
@@ -33,138 +108,28 @@ def analyze_ast_flaws(code_str):
         tree = ast.parse(code_str)
     except SyntaxError as e:
         return [{
-            "type": "SyntaxError",
+            "type": "Syntax Error",
             "line": e.lineno,
             "message": e.msg,
-            "explanation": "Python cannot parse this code grammatically.",
+            "explanation": "Python cannot parse this code grammatically because it breaks language syntax rules.",
+            "analogy": "🚨 **Analogy:** Like ending a sentence mid-word without punctuation.",
             "fix": "Check for missing colons (`:`), unmatched brackets, or typos near this line."
         }], None
 
     for node in ast.walk(tree):
-        # 1. Catch bare except clauses
+        # 1. Detect bare except / silent error suppression
         if isinstance(node, ast.ExceptHandler) and node.type is None:
             flaws.append({
-                "type": "Bare Except Clause",
+                "type": "Silent Error Suppression",
                 "line": node.lineno,
-                "message": "Catching all exceptions indiscriminately with `except:`",
-                "explanation": "Bare except clauses hide critical bugs and system interruptions (like Ctrl+C).",
-                "fix": "Specify explicit exceptions, e.g., `except (ZeroDivisionError, TypeError):`."
+                "message": "Using `except:` (or `except: pass`) silently hides bugs.",
+                "explanation": "Your code experienced an internal error, but `except:` hid the error and returned `None` instead of fixing the underlying problem.",
+                "analogy": "🙈 **Analogy:** Silencing a fire alarm when you smell smoke instead of putting out the fire.",
+                "before": "except:\n    pass",
+                "after": "except ZeroDivisionError:\n    return 0.0  # Explicit error handling"
             })
         
-        # 2. Catch range(len(...)) loop anti-patterns
+        # 2. Detect range(len(...)) loop anti-pattern
         elif isinstance(node, ast.For) and isinstance(node.iter, ast.Call):
             func = getattr(node.iter.func, 'id', None)
-            if func == 'range' and len(node.iter.args) == 1:
-                arg = node.iter.args[0]
-                if isinstance(arg, ast.Call) and getattr(arg.func, 'id', None) == 'len':
-                    flaws.append({
-                        "type": "Non-Pythonic Loop",
-                        "line": node.lineno,
-                        "message": "Unnecessary `for i in range(len(...))` pattern.",
-                        "explanation": "Iterating over index ranges is less readable and slower than direct iteration in Python.",
-                        "fix": "Iterate directly over elements: `for item in sequence:` or use `for index, item in enumerate(sequence):`."
-                    })
-
-    return flaws, tree
-
-
-if st.button("Run & Analyze Code", type="primary"):
-    st.divider()
-    
-    ast_flaws, parsed_tree = analyze_ast_flaws(code_input)
-    
-    # Block execution if a SyntaxError exists
-    if ast_flaws and ast_flaws[0]["type"] == "SyntaxError":
-        err = ast_flaws[0]
-        col1, col2 = st.columns(2)
-        with col1:
-            st.error(f"❌ **Syntax Error on Line {err['line']}**")
-            st.code(err["message"])
-        with col2:
-            st.warning(f"**Why it failed:** {err['explanation']}")
-            st.info(f"💡 **Suggested Fix:** {err['fix']}")
-        st.stop()
-
-    col1, col2 = st.columns(2)
-
-    # Execute code in isolated stdout buffer
-    output_buffer = io.StringIO()
-    sys.stdout = output_buffer
-    runtime_error = None
-
-    try:
-        execution_scope = {}
-        exec(code_input, execution_scope)
-        sys.stdout = sys.__stdout__
-    except Exception as exc:
-        sys.stdout = sys.__stdout__
-        tb = traceback.extract_tb(sys.exc_info()[2])
-        error_line = tb[-1].lineno if tb else "Unknown"
-        
-        exc_name = type(exc).__name__
-        runtime_fixes = {
-            "ZeroDivisionError": (
-                "Attempted to divide a number by zero (`0`).",
-                "Add a guard clause: `if not numbers: return 0` before performing division."
-            ),
-            "IndexError": (
-                "Attempted to access a sequence index position that does not exist.",
-                "Check sequence boundaries or verify length using `if index < len(sequence):`."
-            ),
-            "KeyError": (
-                "Attempted to access a dictionary key that does not exist.",
-                "Use `dict.get('key', default_value)` or verify key existence with `if key in dict:`."
-            ),
-            "TypeError": (
-                "Operation attempted on incompatible data types.",
-                "Explicitly convert variable types using `int()`, `str()`, or `float()` before combining."
-            ),
-            "NameError": (
-                "Referenced a variable or function name before it was defined.",
-                "Ensure variables are instantiated in the current scope prior to referencing."
-            )
-        }
-        
-        reasoning, fix_suggestion = runtime_fixes.get(
-            exc_name, 
-            (f"An unexpected {exc_name} occurred: {exc}", "Review inputs and call stacks for type mismatches.")
-        )
-        
-        runtime_error = {
-            "type": f"Runtime Crash: {exc_name}",
-            "line": error_line,
-            "message": str(exc),
-            "explanation": reasoning,
-            "fix": fix_suggestion
-        }
-
-    # Left Column: Execution Console Output
-    with col1:
-        st.subheader("Console Output")
-        if runtime_error:
-            st.error(f"💥 **{runtime_error['type']}** (Line {runtime_error['line']})")
-            st.text_area("Output before crash:", output_buffer.getvalue(), height=130)
-        else:
-            st.success("✅ **Execution Completed Successfully**")
-            st.text_area("Output:", output_buffer.getvalue(), height=130)
-
-    # Right Column: AST Static Flaws & Suggested Fixes
-    with col2:
-        st.subheader("Code Analysis & Suggested Fixes")
-        
-        if ast_flaws:
-            st.markdown("#### ⚠️ Static AST Warnings")
-            for flaw in ast_flaws:
-                st.warning(f"**[{flaw['type']}] Line {flaw['line']}:** {flaw['message']}")
-                st.write(f"**Why:** {flaw['explanation']}")
-                st.info(f"💡 **Fix:** {flaw['fix']}")
-                st.markdown("---")
-
-        if runtime_error:
-            st.markdown("#### 💥 Runtime Crash Analysis")
-            st.warning(f"**Error Message:** `{runtime_error['message']}`")
-            st.write(f"**Why:** {runtime_error['explanation']}")
-            st.info(f"💡 **Fix:** {runtime_error['fix']}")
-
-        if not ast_flaws and not runtime_error:
-            st.info("🎉 No static AST anti-patterns or runtime crashes detected!")
+            if
