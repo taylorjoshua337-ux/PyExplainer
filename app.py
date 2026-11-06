@@ -3,6 +3,7 @@ import ast
 import traceback
 import sys
 import io
+import requests
 
 # Page Configuration
 st.set_page_config(
@@ -100,7 +101,7 @@ st.sidebar.info(
 )
 
 # ------------------------------------------------------------------------------
-# Helper: Detailed Syntax Error Parser
+# Helper Functions
 # ------------------------------------------------------------------------------
 def get_syntax_error_details(msg):
     """Maps Python SyntaxError messages to detailed explanations and code solutions."""
@@ -115,8 +116,8 @@ def get_syntax_error_details(msg):
         }
     elif "expected ':'" in msg_lower:
         return {
-            "explanation": "Python statement headers (like `if`, `def`, `for`, `while`, `try`, `except`) require a colon `:` at the end of the line to start a code block.",
-            "analogy": "✍️ **Analogy:** Forgetting a punctuation mark at the end of a sentence header.",
+            "explanation": "Python statement headers (like `if`, `def`, `for`, `while`, `try`, `except`) require a colon `:` at the end of the header line to start a code block.",
+            "analogy": "✍️ **Analogy:** Forgetting a period or punctuation mark at the end of a sentence header.",
             "before": "def calculate_average(numbers)",
             "after": "def calculate_average(numbers):"
         }
@@ -142,9 +143,6 @@ def get_syntax_error_details(msg):
             "after": "# Ensure clean syntax and matching colons/brackets"
         }
 
-# ------------------------------------------------------------------------------
-# Core Analysis Engine
-# ------------------------------------------------------------------------------
 def analyze_ast_flaws(code_str):
     """Performs static analysis using Python AST to catch syntax errors and anti-patterns."""
     flaws = []
@@ -193,11 +191,33 @@ def analyze_ast_flaws(code_str):
 
     return flaws, tree
 
+def query_local_ollama(prompt, code_context):
+    """Sends user prompt and code context to local Ollama server."""
+    full_prompt = (
+        f"You are PyExplain AI, a friendly Python coding tutor for beginners.\n\n"
+        f"--- CODE CONTEXT ---\n{code_context}\n\n"
+        f"--- USER QUESTION ---\n{prompt}\n\n"
+        f"Provide a clear, helpful explanation with code examples where relevant:"
+    )
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "qwen2.5-coder",
+                "prompt": full_prompt,
+                "stream": False
+            },
+            timeout=30
+        )
+        return response.json().get("response", "No response received from local Ollama.")
+    except Exception as e:
+        return f"⚠️ Could not connect to local Ollama. Ensure `ollama run qwen2.5-coder` is running in your terminal. Error: {e}"
+
 # ------------------------------------------------------------------------------
 # Main UI Layout
 # ------------------------------------------------------------------------------
 st.title("🐍 PyExplain: Python Error & Flaw Explainer")
-st.write("Analyze code structure, catch static anti-patterns, and view plain-English runtime explanations.")
+st.write("Analyze code structure, catch static anti-patterns, and chat with a local AI tutor.")
 
 code_input = st.text_area(
     "Source Code:", 
@@ -293,7 +313,12 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
     # --------------------------------------------------------------------------
     # 2. Main Output Tabs
     # --------------------------------------------------------------------------
-    tab_out, tab_ast, tab_runtime = st.tabs(["🚀 Console Output", "⚠️ AST Code Analysis", "💥 Runtime Debugger"])
+    tab_out, tab_ast, tab_runtime, tab_ai = st.tabs([
+        "🚀 Console Output", 
+        "⚠️ AST Code Analysis", 
+        "💥 Runtime Debugger",
+        "🤖 Local AI Tutor"
+    ])
 
     # --- TAB 1: Console Output ---
     with tab_out:
@@ -363,3 +388,30 @@ if st.button("🚀 Run & Analyze Code", type="primary"):
             
             st.caption("✅ Suggested Code Fix")
             st.code(runtime_error['fix'], language="python")
+
+    # --- TAB 4: Local AI Tutor ---
+    with tab_ai:
+        st.subheader("🤖 Local AI Code Assistant")
+        st.caption("Powered offline by local Ollama (`qwen2.5-coder`) — No API key required.")
+
+        if "ai_messages" not in st.session_state:
+            st.session_state.ai_messages = [
+                {"role": "assistant", "content": "👋 Hi! I can see your current code and error analysis. Ask me how to fix bugs, refactor loops, or explain Python concepts!"}
+            ]
+
+        for msg in st.session_state.ai_messages:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+
+        if user_input := st.chat_input("Ask the AI tutor about your code..."):
+            st.session_state.ai_messages.append({"role": "user", "content": user_input})
+            with st.chat_message("user"):
+                st.write(user_input)
+
+            context_str = f"Code:\n{code_input}\n\nAST Flaws:\n{ast_flaws}\n\nRuntime Crash:\n{runtime_error}"
+
+            with st.chat_message("assistant"):
+                with st.spinner("qwen2.5-coder thinking locally..."):
+                    reply = query_local_ollama(user_input, context_str)
+                    st.write(reply)
+                    st.session_state.ai_messages.append({"role": "assistant", "content": reply})
