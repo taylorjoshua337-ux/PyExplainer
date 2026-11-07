@@ -12,7 +12,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
+st.markdown(
+    '<meta name="google-site-verification" content="LWF4Ut9s1TjlzIzVqY8rUcLV9eikka1BU35GImUirqg" />',
+    unsafe_allow_html=True
+)
 # Custom CSS for UI Polish & Card Styling
 st.markdown("""
 <style>
