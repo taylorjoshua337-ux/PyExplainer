@@ -12,9 +12,14 @@ What changed vs. the original:
     limits, hard timeout, capped output, import allowlist, restricted builtins) after
     an AST check rejects dangerous constructs. The API key is never visible to it.
   * Extras: HTML escaping, input/size limits, cooldowns, friendlier errors, more checks.
+  * v3: app-wide rate limits + sandbox concurrency cap (can't be bypassed by refreshing),
+    `super().__init__()` and `input()` now work in the sandbox, "Your code" panels show the
+    user's real lines, per-finding AI fixes, streamed replies, quick prompts, shadowed-builtin
+    check, tracebacks, run timing, and a downloadable report.
 """
 
 import ast
+import hashlib
 import html
 import json
 import logging
@@ -22,8 +27,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
 import time
 import traceback
+from collections import deque
 
 import streamlit as st
 from google import genai
@@ -85,6 +93,12 @@ AI_COOLDOWN_SEC = 3.0          # min seconds between AI questions per session
 MAX_AI_MESSAGES = 40           # max questions per session
 MAX_HISTORY_TURNS = 8          # chat turns sent back to Gemini
 MAX_CONTEXT_CHARS = 6000       # code/analysis context sent to Gemini
+MAX_STDIN_CHARS = 1000         # max size of program input (stdin)
+GLOBAL_AI_PER_MINUTE = 20      # app-wide cap on Gemini calls (all visitors combined)
+GLOBAL_AI_PER_DAY = 600
+GLOBAL_RUNS_PER_MINUTE = 60    # app-wide cap on sandbox runs
+GLOBAL_RUNS_PER_DAY = 5000
+MAX_CONCURRENT_RUNS = 3        # sandbox processes allowed at the same time
 # Tried in order; a 404 (model retired/renamed) falls through to the next one.
 # Override by setting GEMINI_MODEL in your Streamlit secrets (no code change needed).
 DEFAULT_GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]
@@ -98,7 +112,7 @@ ALLOWED_MODULES = [
 
 # Builtins removed from the sandbox, and names rejected by the static check.
 BLOCKED_BUILTINS = [
-    "open", "exec", "eval", "compile", "input", "breakpoint", "globals", "locals",
+    "open", "exec", "eval", "compile", "breakpoint", "globals", "locals",
     "vars", "getattr", "setattr", "delattr", "help", "exit", "quit", "memoryview",
     "copyright", "credits", "license",
 ]
@@ -114,12 +128,60 @@ FORBIDDEN_ATTRS = {
 }
 
 # ------------------------------------------------------------------------------
+# App-wide protection: shared rate limits & concurrency cap
+# (st.session_state resets on every page refresh, so per-session limits alone are bypassable)
+# ------------------------------------------------------------------------------
+class RateLimiter:
+    """Thread-safe sliding-window (per minute) + per-day counter shared by ALL visitors."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._events = {}
+        self._daily = {}
+
+    def allow(self, name, per_minute, per_day):
+        """Returns (True, 0) if allowed, else (False, retry_seconds | "day")."""
+        now = time.time()
+        today = time.strftime("%Y-%m-%d")
+        with self._lock:
+            window = self._events.setdefault(name, deque())
+            while window and now - window[0] > 60:
+                window.popleft()
+            day, count = self._daily.get(name, (today, 0))
+            if day != today:
+                day, count = today, 0
+            if count >= per_day:
+                return False, "day"
+            if len(window) >= per_minute:
+                return False, int(60 - (now - window[0])) + 1
+            window.append(now)
+            self._daily[name] = (day, count + 1)
+            return True, 0
+
+
+@st.cache_resource
+def get_limiter():
+    return RateLimiter()
+
+
+@st.cache_resource
+def get_sandbox_slots():
+    return threading.BoundedSemaphore(MAX_CONCURRENT_RUNS)
+
+
+def busy_message(reason):
+    if reason == "day":
+        return "Today's free usage limit for this app has been reached. Please try again tomorrow."
+    return f"The app is very busy right now. Please try again in about {reason} seconds."
+
+
+# ------------------------------------------------------------------------------
 # Sandbox: runs inside a separate, locked-down Python process
 # ------------------------------------------------------------------------------
 RESULT_MARKER = "__PYEXPLAIN_RESULT__"
 
 _RUNNER_TEMPLATE = r'''
-import sys, json, traceback, builtins
+import sys, json, traceback, builtins, io
 
 try:
     import resource
@@ -142,7 +204,9 @@ BLOCKED = set(__BLOCKED__)
 MAX_OUT = __MAXOUT__
 MARKER = "__MARKER__"
 
-code = sys.stdin.read()
+payload = json.loads(sys.stdin.read())
+code = payload["code"]
+sys.stdin = io.StringIO(payload["stdin"])
 real_import = builtins.__import__
 
 def safe_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -175,14 +239,17 @@ try:
     )
 except BaseException as exc:
     line = None
+    trace = []
     for fs in traceback.extract_tb(exc.__traceback__):
         if fs.filename == "<user_code>":
             line = fs.lineno
+            trace.append("line %d, in %s" % (fs.lineno, fs.name))
     result = {
         "ok": False,
         "type": type(exc).__name__,
         "message": str(exc)[:500],
         "line": line,
+        "trace": trace[-10:],
     }
 finally:
     sys.stdout = real_stdout
@@ -203,13 +270,18 @@ SANDBOX_RUNNER = (
 )
 
 
-def run_in_sandbox(code: str) -> dict:
-    """Run user code in an isolated subprocess. Returns {"output": str, "error": dict|None}."""
+def _error(type_, message, line=None, trace=None):
+    return {"type": type_, "message": message, "line": line, "trace": trace or []}
+
+
+def _execute_in_subprocess(code: str, stdin_text: str) -> dict:
+    payload = json.dumps({"code": code, "stdin": stdin_text}).encode("utf-8")
+    started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="pyexplain_") as workdir:
         try:
             proc = subprocess.run(
                 [sys.executable, "-I", "-S", "-c", SANDBOX_RUNNER],
-                input=code.encode("utf-8"),
+                input=payload,
                 capture_output=True,
                 timeout=RUN_TIMEOUT_SEC,
                 cwd=workdir,
@@ -222,19 +294,14 @@ def run_in_sandbox(code: str) -> dict:
                 partial = partial.decode("utf-8", "replace")
             return {
                 "output": partial[:MAX_OUTPUT_CHARS],
-                "error": {
-                    "type": "TimeoutError",
-                    "message": f"Execution exceeded {RUN_TIMEOUT_SEC} seconds (infinite loop?).",
-                    "line": None,
-                },
+                "elapsed": time.perf_counter() - started,
+                "error": _error("TimeoutError", f"Execution exceeded {RUN_TIMEOUT_SEC} seconds (infinite loop?)."),
             }
         except Exception:
             logger.exception("Sandbox failed to start")
-            return {
-                "output": "",
-                "error": {"type": "SandboxError", "message": "The sandbox could not be started.", "line": None},
-            }
+            return {"output": "", "elapsed": 0.0, "error": _error("SandboxError", "The sandbox could not be started.")}
 
+    elapsed = time.perf_counter() - started
     output = proc.stdout.decode("utf-8", "replace")[:MAX_OUTPUT_CHARS]
     stderr = proc.stderr.decode("utf-8", "replace")
     idx = stderr.rfind(RESULT_MARKER)
@@ -243,32 +310,45 @@ def run_in_sandbox(code: str) -> dict:
         # Process died without reporting (killed by a CPU/memory limit, etc.)
         return {
             "output": output,
-            "error": {
-                "type": "ResourceLimitExceeded",
-                "message": f"Process was terminated (exit code {proc.returncode}); "
-                           "it likely used too much memory or CPU time.",
-                "line": None,
-            },
+            "elapsed": elapsed,
+            "error": _error(
+                "ResourceLimitExceeded",
+                f"Process was terminated (exit code {proc.returncode}); it likely used too much memory or CPU time.",
+            ),
         }
 
     try:
         result = json.loads(stderr[idx + len(RESULT_MARKER):])
     except json.JSONDecodeError:
-        return {
-            "output": output,
-            "error": {"type": "SandboxError", "message": "Could not read the sandbox result.", "line": None},
-        }
+        return {"output": output, "elapsed": elapsed, "error": _error("SandboxError", "Could not read the sandbox result.")}
 
     if result.get("ok"):
-        return {"output": output, "error": None}
+        return {"output": output, "elapsed": elapsed, "error": None}
     return {
         "output": output,
-        "error": {
-            "type": result.get("type", "Exception"),
-            "message": result.get("message", ""),
-            "line": result.get("line"),
-        },
+        "elapsed": elapsed,
+        "error": _error(
+            result.get("type", "Exception"),
+            result.get("message", ""),
+            result.get("line"),
+            result.get("trace"),
+        ),
     }
+
+
+def run_in_sandbox(code: str, stdin_text: str = "") -> dict:
+    """Run user code in an isolated subprocess. Returns {"output", "elapsed", "error"}."""
+    slots = get_sandbox_slots()
+    if not slots.acquire(timeout=10):
+        return {
+            "output": "",
+            "elapsed": 0.0,
+            "error": _error("SandboxBusy", "All sandbox slots are busy right now. Please try again in a few seconds."),
+        }
+    try:
+        return _execute_in_subprocess(code, stdin_text)
+    finally:
+        slots.release()
 
 
 def find_sandbox_violations(tree: ast.AST) -> list:
@@ -295,7 +375,7 @@ def find_sandbox_violations(tree: ast.AST) -> list:
             if node.id in FORBIDDEN_NAMES or (node.id.startswith("__") and node.id != "__name__"):
                 add(line, f"Using `{node.id}` is not allowed in the sandbox.")
         elif isinstance(node, ast.Attribute):
-            if node.attr.startswith("_") or node.attr in FORBIDDEN_ATTRS:
+            if node.attr != "__init__" and (node.attr.startswith("_") or node.attr in FORBIDDEN_ATTRS):
                 hint = " Use an f-string instead." if node.attr in ("format", "format_map") else ""
                 add(line, f"Accessing attribute `.{node.attr}` is not allowed in the sandbox.{hint}")
     return violations
@@ -351,6 +431,25 @@ value = None
 if value == None:
     print("value is empty")""",
 
+    "Class with super() and input()": """class Animal:
+    def __init__(self, name):
+        self.name = name
+
+class Dog(Animal):
+    def __init__(self, name):
+        super().__init__(name)
+
+name = input("Dog's name: ")
+dog = Dog(name)
+print(f"Good boy, {dog.name}!")""",
+
+    "Shadowed Builtin": """list = [3, 1, 2]
+
+for i in range(len(list)):
+    print(list[i])
+
+print(sum(list))""",
+
     "Clean Pythonic Code": """def calculate_average(numbers):
     if not numbers:
         return 0.0
@@ -370,8 +469,9 @@ with st.sidebar.expander("🔒 Sandbox rules"):
         f"- Runs in a separate process with a **{RUN_TIMEOUT_SEC}s** time limit\n"
         f"- No file, network, or system access\n"
         f"- Allowed imports: `{'`, `'.join(ALLOWED_MODULES)}`\n"
-        "- No `open`, `eval`, `exec`, `input`, `getattr`, `.format()` (use f-strings)\n"
-        "- Attributes starting with `_` are blocked"
+        "- No `open`, `eval`, `exec`, `getattr`, `.format()` (use f-strings)\n"
+        "- `input()` reads from the *Program input* box (one value per line)\n"
+        "- Attributes starting with `_` are blocked (except `__init__`)"
     )
 
 # ------------------------------------------------------------------------------
@@ -408,11 +508,41 @@ def get_model_candidates():
     return [override] if override else list(DEFAULT_GEMINI_MODELS)
 
 
-def query_gemini_tutor(history: list, question: str, context: str):
-    """Returns (text, ok). `history` holds earlier chat messages (without the new question)."""
+class TutorError(Exception):
+    """A user-presentable problem with the AI tutor."""
+
+
+def _tutor_error_message(exc, model, api_key):
+    code = getattr(exc, "code", None)
+    detail = str(getattr(exc, "message", None) or exc).replace(api_key, "***")[:300]
+    if code == 429:
+        return "⚠️ The AI is rate-limited or out of quota right now. Wait a moment and try again."
+    if code in (401, 403) or "API key" in detail:
+        return f"⚠️ The AI service rejected your API key (HTTP {code}). Check `GEMINI_API_KEY` in your secrets."
+    if code == 404:
+        return f"⚠️ Model `{model}` was not found (HTTP 404). Set `GEMINI_MODEL` in your secrets to a current model name."
+    return f"⚠️ The AI service returned an error (HTTP {code}) for `{model}`: {detail}"
+
+
+def _explain_empty(response):
+    """Why did Gemini return no text?"""
+    block = getattr(getattr(response, "prompt_feedback", None), "block_reason", None)
+    if block:
+        return "⚠️ That request was blocked by the AI's safety filters. Try rewording it."
+    candidates = getattr(response, "candidates", None) or []
+    reason = str(getattr(candidates[0], "finish_reason", "")) if candidates else ""
+    if "MAX_TOKENS" in reason:
+        return "⚠️ The answer was cut off before it started. Try a shorter or more specific question."
+    if "SAFETY" in reason or "PROHIBITED" in reason or "BLOCK" in reason:
+        return "⚠️ The response was blocked by the AI's safety filters. Try rewording your question."
+    return "⚠️ The AI returned an empty response. Please try again."
+
+
+def stream_gemini_tutor(history: list, question: str, context: str):
+    """Generator yielding reply text as it arrives. Raises TutorError on problems."""
     api_key = get_api_key()
     if not api_key:
-        return ("⚠️ Missing API key. Add `GEMINI_API_KEY` under **Manage app → Settings → Secrets**.", False)
+        raise TutorError("⚠️ Missing API key. Add `GEMINI_API_KEY` under **Manage app → Settings → Secrets**.")
 
     contents = []
     for m in history[-MAX_HISTORY_TURNS:]:
@@ -432,45 +562,84 @@ def query_gemini_tutor(history: list, question: str, context: str):
     )
 
     client = _build_client(api_key)
-    response, last_error = None, None
+    last_error = None
     for model in get_model_candidates():
+        yielded, last_chunk = False, None
         try:
-            response = client.models.generate_content(model=model, contents=contents, config=config)
-            break
+            for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
+                last_chunk = chunk
+                text = getattr(chunk, "text", None)
+                if text:
+                    yielded = True
+                    yield text
         except Exception as exc:
             logger.exception("Gemini request failed (model=%s)", model)
+            if yielded:
+                raise TutorError("⚠️ The connection to the AI was interrupted. Ask again to retry.")
             last_error = (model, exc)
             if getattr(exc, "code", None) == 404:
                 continue  # model not found / retired: try the next candidate
-            break
+            raise TutorError(_tutor_error_message(exc, model, api_key))
+        else:
+            if yielded:
+                return
+            raise TutorError(_explain_empty(last_chunk))
 
-    if response is None:
-        model, exc = last_error
-        code = getattr(exc, "code", None)
-        detail = str(getattr(exc, "message", None) or exc).replace(api_key, "***")[:300]
-        if code == 429:
-            return ("⚠️ The AI is rate-limited or out of quota right now. Wait a moment and try again.", False)
-        if code in (401, 403) or "API key" in detail:
-            return (f"⚠️ The AI service rejected your API key (HTTP {code}). Check `GEMINI_API_KEY` in your secrets.", False)
-        if code == 404:
-            return (f"⚠️ Model `{model}` was not found (HTTP 404). Set `GEMINI_MODEL` in your secrets to a current model name.", False)
-        return (f"⚠️ The AI service returned an error (HTTP {code}) for `{model}`: {detail}", False)
+    model, exc = last_error
+    raise TutorError(_tutor_error_message(exc, model, api_key))
 
-    text = getattr(response, "text", None)
-    if text and text.strip():
-        return (text, True)
 
-    # Empty reply: work out why instead of showing nothing.
-    block = getattr(getattr(response, "prompt_feedback", None), "block_reason", None)
-    if block:
-        return ("⚠️ That request was blocked by the AI's safety filters. Try rewording it.", False)
-    candidates = getattr(response, "candidates", None) or []
-    reason = str(getattr(candidates[0], "finish_reason", "")) if candidates else ""
-    if "MAX_TOKENS" in reason:
-        return ("⚠️ The answer was cut off before it started. Try a shorter or more specific question.", False)
-    if "SAFETY" in reason or "PROHIBITED" in reason or "BLOCK" in reason:
-        return ("⚠️ The response was blocked by the AI's safety filters. Try rewording your question.", False)
-    return ("⚠️ The AI returned an empty response. Please try again.", False)
+def run_tutor(history: list, question: str, context: str):
+    """Streams the tutor's reply into the current container. Returns (reply_text, ok)."""
+    collected = []
+
+    def _gen():
+        for piece in stream_gemini_tutor(history, question, context):
+            collected.append(piece)
+            yield piece
+
+    try:
+        st.write_stream(_gen())
+        return "".join(collected), True
+    except TutorError as exc:
+        partial = "".join(collected)
+        st.markdown(str(exc))
+        return (partial + "\n\n" if partial else "") + str(exc), False
+
+
+def ai_guard():
+    """Returns a message if an AI call is not allowed right now, else None (and counts the call)."""
+    now = time.time()
+    if st.session_state.get("ai_question_count", 0) >= MAX_AI_MESSAGES:
+        return "You've reached the question limit for this session. Clear the chat to continue."
+    if now - st.session_state.get("last_ai_call", 0) < AI_COOLDOWN_SEC:
+        return "Please wait a few seconds between questions."
+    allowed, reason = get_limiter().allow("ai", GLOBAL_AI_PER_MINUTE, GLOBAL_AI_PER_DAY)
+    if not allowed:
+        return busy_message(reason)
+    st.session_state.last_ai_call = now
+    st.session_state.ai_question_count = st.session_state.get("ai_question_count", 0) + 1
+    return None
+
+
+def render_ai_fix(key: str, prompt: str, analysis: dict):
+    """A button that asks Gemini for a fix tailored to the user's own code (cached per finding)."""
+    fixes = st.session_state.setdefault("ai_fixes", {})
+    if key in fixes:
+        st.markdown("**✨ AI fix for your code**")
+        st.markdown(fixes[key])
+        return
+    if st.button("✨ Get an AI fix for my code", key=f"fixbtn_{key}"):
+        blocked = ai_guard()
+        if blocked:
+            st.warning(blocked)
+            return
+        st.markdown("**✨ AI fix for your code**")
+        reply, ok = run_tutor([], prompt, build_ai_context(analysis["code"], analysis))
+        if ok:
+            if len(fixes) >= 30:
+                fixes.pop(next(iter(fixes)))
+            fixes[key] = reply
 
 
 # ------------------------------------------------------------------------------
@@ -520,16 +689,40 @@ def get_syntax_error_details(msg):
     }
 
 
+SHADOWABLE_BUILTINS = {
+    "list", "dict", "set", "str", "int", "float", "bool", "tuple", "sum", "max", "min",
+    "len", "type", "id", "input", "object", "all", "any", "map", "filter", "sorted",
+    "range", "print", "next", "iter", "hash", "round", "abs", "zip",
+}
+
+
+def _snippet(lines, node, header_only=False, max_lines=8):
+    """The user's real source lines for `node` (dedented, truncated if long)."""
+    start = node.lineno - 1
+    if header_only and getattr(node, "body", None) and node.body[0].lineno > node.lineno:
+        end = node.body[0].lineno - 1
+    else:
+        end = getattr(node, "end_lineno", None) or node.lineno
+    chunk = lines[start:end]
+    text = textwrap.dedent("\n".join(chunk[:max_lines]))
+    return text + ("\n..." if len(chunk) > max_lines else "")
+
+
 def analyze_ast_flaws(code_str):
     """Static analysis with the AST to catch syntax errors and anti-patterns."""
     flaws = []
+    lines = code_str.splitlines()
     try:
         tree = ast.parse(code_str)
     except SyntaxError as e:
         details = get_syntax_error_details(e.msg or "invalid syntax")
+        ln = e.lineno or 1
+        around = textwrap.dedent("\n".join(lines[max(0, ln - 3):ln])).strip("\n")
+        if around.strip():
+            details["before"] = around  # show the user's real lines, not a canned example
         return [{
             "type": "Syntax Error",
-            "line": e.lineno or 1,
+            "line": ln,
             "message": e.msg,
             **details,
         }], None
@@ -552,7 +745,7 @@ def analyze_ast_flaws(code_str):
                 "message": "Using `except:` (or `except: pass`) silently hides bugs.",
                 "explanation": "Your code can hit an internal error, but a bare `except:` hides it so you never find out.",
                 "analogy": "🙈 **Analogy:** Silencing a fire alarm when you smell smoke.",
-                "before": "except:\n    pass",
+                "before": _snippet(lines, node),
                 "after": "except ZeroDivisionError:\n    return 0.0",
             })
         elif isinstance(node, ast.For) and isinstance(node.iter, ast.Call):
@@ -566,7 +759,7 @@ def analyze_ast_flaws(code_str):
                         "message": "Unnecessary `for i in range(len(...))` pattern.",
                         "explanation": "Iterating over index ranges manually is less readable than direct iteration.",
                         "analogy": "📋 **Analogy:** Looking up page numbers in an index to read a book page-by-page.",
-                        "before": "for i in range(len(items)):\n    print(items[i])",
+                        "before": _snippet(lines, node),
                         "after": "for item in items:\n    print(item)",
                     })
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -578,7 +771,7 @@ def analyze_ast_flaws(code_str):
                     "message": f"`{node.name}` uses a list/dict/set as a default argument value.",
                     "explanation": "Default values are created once, when the function is defined, and then shared by every call. Changes made in one call leak into the next.",
                     "analogy": "🧺 **Analogy:** A shared basket at the door: every visitor adds to the same basket instead of getting a fresh one.",
-                    "before": "def add_item(item, basket=[]):\n    basket.append(item)\n    return basket",
+                    "before": _snippet(lines, node, header_only=True),
                     "after": "def add_item(item, basket=None):\n    if basket is None:\n        basket = []\n    basket.append(item)\n    return basket",
                 })
         elif isinstance(node, ast.Compare):
@@ -590,10 +783,24 @@ def analyze_ast_flaws(code_str):
                         "message": "Use `is None` / `is not None` instead of `== None` / `!= None`.",
                         "explanation": "`None` is a single unique object, so identity (`is`) is the correct and safest check. `==` can be overridden by custom classes.",
                         "analogy": "🪪 **Analogy:** Checking someone's actual ID instead of asking whether they look like the person.",
-                        "before": "if value == None:\n    ...",
+                        "before": _snippet(lines, node),
                         "after": "if value is None:\n    ...",
                     })
+        elif (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id in SHADOWABLE_BUILTINS) or (
+            isinstance(node, ast.arg) and node.arg in SHADOWABLE_BUILTINS
+        ):
+            name = node.id if isinstance(node, ast.Name) else node.arg
+            flaws.append({
+                "type": "Shadowed Builtin",
+                "line": node.lineno,
+                "message": f"`{name}` is a built-in Python name, and this code replaces it.",
+                "explanation": f"After this line, `{name}(...)` no longer does what Python intended in this scope, which causes confusing bugs later.",
+                "analogy": "🏷️ **Analogy:** Renaming yourself 'Mom' at a family dinner: everyone gets confused about who is who.",
+                "before": _snippet(lines, node),
+                "after": f"{name}_items = [3, 1, 2]  # pick a descriptive, non-built-in name",
+            })
 
+    flaws.sort(key=lambda f: f.get("line") or 0)
     return flaws, tree
 
 
@@ -643,6 +850,11 @@ RUNTIME_HELP = {
         "🚧 **Analogy:** Trying to borrow a tool from a locked workshop.",
         "# Use only the allowed modules listed in the sidebar",
     ),
+    "EOFError": (
+        "The program asked for input with `input()`, but there was none left.",
+        "🎤 **Analogy:** Asking a question and getting silence because nobody is in the room.",
+        "# Type the values in the 'Program input' box, one per line",
+    ),
     "TimeoutError": (
         "The code ran longer than the allowed time limit, often because of an infinite loop.",
         "🔁 **Analogy:** A hamster wheel with no exit.",
@@ -669,28 +881,32 @@ def build_runtime_error(err: dict) -> dict:
         "explanation": reasoning,
         "analogy": analogy,
         "fix": fix,
+        "trace": err.get("trace", []),
     }
 
 
-def analyze_code(code: str) -> dict:
+def analyze_code(code: str, stdin_text: str = "") -> dict:
     ast_flaws, tree = analyze_ast_flaws(code)
     has_syntax_err = bool(ast_flaws) and ast_flaws[0]["type"] == "Syntax Error"
-    violations, output, runtime_error = [], "", None
+    violations, output, runtime_error, elapsed = [], "", None, None
 
     if not has_syntax_err:
         violations = find_sandbox_violations(tree)
         if not violations:
-            result = run_in_sandbox(code)
+            result = run_in_sandbox(code, stdin_text)
             output = result["output"]
+            elapsed = result["elapsed"]
             if result["error"]:
                 runtime_error = build_runtime_error(result["error"])
 
     return {
         "code": code,
+        "stdin": stdin_text,
         "ast_flaws": ast_flaws,
         "has_syntax_err": has_syntax_err,
         "violations": violations,
         "output": output,
+        "elapsed": elapsed,
         "runtime_error": runtime_error,
     }
 
@@ -720,6 +936,46 @@ def build_ai_context(code: str, analysis) -> str:
 # ------------------------------------------------------------------------------
 # Main UI
 # ------------------------------------------------------------------------------
+PRESET_STDIN = {"Class with super() and input()": "Rex"}
+
+QUICK_PROMPTS = [
+    ("🧒 Explain simply", "Explain what is wrong (or could be improved) in my code, in simple words with an analogy."),
+    ("♻️ Refactor it", "Refactor my code to be cleaner and more Pythonic, and explain each change."),
+    ("🧪 Write tests", "Write a few simple test cases (plain assert statements) for my code."),
+]
+
+
+def build_report(a: dict) -> str:
+    lines = ["# PyExplain Report", "", "## Source code", "", "```python", a["code"], "```", ""]
+    if a.get("stdin"):
+        lines += ["## Program input", "", "```", a["stdin"], "```", ""]
+    if a["has_syntax_err"]:
+        status = "Syntax error (not executed)"
+    elif a["violations"]:
+        status = "Blocked by sandbox"
+    elif a["runtime_error"]:
+        status = f"Crashed with {a['runtime_error']['type']}"
+    else:
+        status = "Ran successfully"
+    lines += ["## Summary", "", f"- Status: {status}", f"- Static findings: {len(a['ast_flaws'])}", ""]
+    for f in a["ast_flaws"]:
+        lines += [f"### {f['type']} (line {f['line']})", "", f["message"], "", f"**Why:** {f['explanation']}", ""]
+        if f.get("analogy"):
+            lines += [f["analogy"], ""]
+        if f.get("before"):
+            lines += ["Your code:", "", "```python", f["before"], "```", ""]
+        if f.get("after"):
+            lines += ["Recommended pattern:", "", "```python", f["after"], "```", ""]
+    for v in a["violations"]:
+        lines += [f"- Sandbox blocked (line {v['line']}): {v['message']}"]
+    err = a["runtime_error"]
+    if err:
+        lines += ["", f"## Runtime error: {err['type']} (line {err['line']})", "", f"`{err['message']}`", "", err["explanation"], ""]
+    if a["output"]:
+        lines += ["## Output", "", "```", a["output"], "```"]
+    return "\n".join(lines)
+
+
 st.title("🐍 PyExplain: Python Error & Flaw Explainer")
 st.write("Analyze code structure, catch static anti-patterns, and chat with an AI tutor.")
 
@@ -729,24 +985,35 @@ code_input = st.text_area(
     value=presets[selected_preset],
     max_chars=MAX_CODE_CHARS,
 )
+stdin_input = st.text_area(
+    "Program input (stdin): one value per line, read by `input()`",
+    height=70,
+    value=PRESET_STDIN.get(selected_preset, ""),
+    max_chars=MAX_STDIN_CHARS,
+)
 
 if st.button("🚀 Run & Analyze Code", type="primary"):
     now = time.time()
     if now - st.session_state.get("last_run", 0) < RUN_COOLDOWN_SEC:
         st.warning("Easy there! Wait a second before running again.")
     else:
-        st.session_state.last_run = now
-        with st.spinner("Analyzing AST structure and running in the sandbox..."):
-            st.session_state.analysis = analyze_code(code_input)
-        st.toast("Analysis completed!", icon="✅")
+        allowed, reason = get_limiter().allow("runs", GLOBAL_RUNS_PER_MINUTE, GLOBAL_RUNS_PER_DAY)
+        if not allowed:
+            st.warning(busy_message(reason))
+        else:
+            st.session_state.last_run = now
+            with st.spinner("Analyzing AST structure and running in the sandbox..."):
+                st.session_state.analysis = analyze_code(code_input, stdin_input)
+            st.toast("Analysis completed!", icon="✅")
 
 # Everything below renders from session_state, so it survives chat reruns.
 analysis = st.session_state.get("analysis")
 code_lines = analysis["code"].split("\n") if analysis else []
+code_hash = hashlib.sha1(analysis["code"].encode("utf-8")).hexdigest()[:10] if analysis else ""
 
 if analysis:
-    if analysis["code"] != code_input:
-        st.info("✏️ The code has changed since the last analysis. Click **Run & Analyze Code** to refresh the results.")
+    if analysis["code"] != code_input or analysis.get("stdin", "") != stdin_input:
+        st.info("✏️ The code or input has changed since the last analysis. Click **Run & Analyze Code** to refresh the results.")
 
     st.divider()
     has_syntax_err = analysis["has_syntax_err"]
@@ -776,6 +1043,13 @@ if analysis:
             grade = "A+ (Clean)"
         st.metric("Code Health Grade", grade)
 
+    st.download_button(
+        "📄 Download report (.md)",
+        data=build_report(analysis),
+        file_name="pyexplain_report.md",
+        mime="text/markdown",
+    )
+
 st.divider()
 
 tab_out, tab_ast, tab_runtime, tab_ai = st.tabs([
@@ -793,13 +1067,16 @@ with tab_out:
         st.error("Syntax Error detected. Code execution was safely blocked.")
     elif analysis["violations"]:
         st.error("Execution was blocked by the sandbox. See the **AST Code Analysis** tab for details.")
-    elif analysis["runtime_error"]:
-        err = analysis["runtime_error"]
-        st.error(f"Execution crashed on Line {err['line']} with `{err['type']}`.")
-        st.text_area("Console log before crash:", analysis["output"] or "[No console output produced]", height=160)
     else:
-        st.success("Execution completed without runtime crashes.")
-        st.text_area("Output Log:", analysis["output"] or "[Code executed successfully with no print output]", height=160)
+        if analysis["runtime_error"]:
+            err = analysis["runtime_error"]
+            st.error(f"Execution crashed on Line {err['line']} with `{err['type']}`.")
+            st.text_area("Console log before crash:", analysis["output"] or "[No console output produced]", height=160)
+        else:
+            st.success("Execution completed without runtime crashes.")
+            st.text_area("Output Log:", analysis["output"] or "[Code executed successfully with no print output]", height=160)
+        if analysis.get("elapsed") is not None:
+            st.caption(f"⏱️ Finished in {analysis['elapsed'] * 1000:.0f} ms (includes sandbox start-up)")
 
 with tab_ast:
     st.subheader("Static Code Quality & Anti-Patterns")
@@ -822,7 +1099,7 @@ with tab_ast:
         if not analysis["ast_flaws"] and not analysis["violations"]:
             st.success("🎉 Excellent! No static code anti-patterns or syntax errors detected.")
 
-        for flaw in analysis["ast_flaws"]:
+        for idx, flaw in enumerate(analysis["ast_flaws"]):
             f_line = flaw.get("line")
             line_str = code_lines[f_line - 1].strip() if isinstance(f_line, int) and 0 < f_line <= len(code_lines) else ""
             st.markdown(
@@ -841,11 +1118,18 @@ with tab_ast:
                 if flaw.get("before") and flaw.get("after"):
                     c1, c2 = st.columns(2)
                     with c1:
-                        st.caption("❌ Avoid (Current Code)")
+                        st.caption("❌ Your code")
                         st.code(flaw["before"], language="python")
                     with c2:
-                        st.caption("✅ Recommended Fix")
+                        st.caption("✅ Recommended pattern")
                         st.code(flaw["after"], language="python")
+                render_ai_fix(
+                    f"{code_hash}:{idx}:{flaw['type']}:{f_line}",
+                    f"My code has a '{flaw['type']}' issue on line {f_line}: {flaw['message']} "
+                    "Show a corrected version of the affected part of MY code (not a generic example) "
+                    "and explain what you changed in a few sentences.",
+                    analysis,
+                )
 
 with tab_runtime:
     st.subheader("Runtime Exception Analysis")
@@ -870,6 +1154,16 @@ with tab_runtime:
         st.info(err["analogy"])
         st.caption("✅ Suggested Code Fix")
         st.code(err["fix"], language="python")
+        if err.get("trace"):
+            with st.expander("🧵 Traceback (your code only)"):
+                st.code("\n".join(err["trace"]) + f"\n{err['type']}: {err['message']}", language="text")
+        render_ai_fix(
+            f"{code_hash}:runtime:{err['type']}:{e_line}",
+            f"My code crashed with {err['type']}: {err['message']} (line {e_line}). "
+            "Show a corrected version of the affected part of MY code (not a generic example) "
+            "and explain the fix in a few sentences.",
+            analysis,
+        )
 
 with tab_ai:
     st.subheader("🤖 Cloud AI Code Assistant")
@@ -880,7 +1174,12 @@ with tab_ai:
             {"role": "assistant", "content": "👋 Hi! Ask me how to fix bugs, refactor loops, or explain Python concepts!"}
         ]
 
-    if st.button("🗑️ Clear chat"):
+    quick = None
+    qcols = st.columns(4)
+    for col, (label, prompt) in zip(qcols[:3], QUICK_PROMPTS):
+        if col.button(label, use_container_width=True):
+            quick = prompt
+    if qcols[3].button("🗑️ Clear chat", use_container_width=True):
         st.session_state.ai_messages = st.session_state.ai_messages[:1]
         st.session_state.ai_question_count = 0
 
@@ -888,27 +1187,20 @@ with tab_ai:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    user_input = st.chat_input("Ask the AI tutor about your code...")
+    user_input = st.chat_input("Ask the AI tutor about your code...") or quick
     if user_input:
         question = user_input.strip()[:MAX_QUESTION_CHARS]
-        now = time.time()
+        if question:
+            blocked = ai_guard()
+            if blocked:
+                st.warning(blocked)
+            else:
+                history = list(st.session_state.ai_messages[1:])  # skip the greeting
+                st.session_state.ai_messages.append({"role": "user", "content": question})
+                with st.chat_message("user"):
+                    st.markdown(question)
 
-        if st.session_state.get("ai_question_count", 0) >= MAX_AI_MESSAGES:
-            st.warning("You've reached the question limit for this session. Clear the chat to continue.")
-        elif now - st.session_state.get("last_ai_call", 0) < AI_COOLDOWN_SEC:
-            st.warning("Please wait a few seconds between questions.")
-        elif question:
-            st.session_state.last_ai_call = now
-            st.session_state.ai_question_count = st.session_state.get("ai_question_count", 0) + 1
-
-            history = list(st.session_state.ai_messages[1:])  # skip the greeting
-            st.session_state.ai_messages.append({"role": "user", "content": question})
-            with st.chat_message("user"):
-                st.markdown(question)
-
-            context = build_ai_context(code_input, analysis)
-            with st.chat_message("assistant"):
-                with st.spinner("Gemini thinking..."):
-                    reply, ok = query_gemini_tutor(history, question, context)
-                st.markdown(reply)
-            st.session_state.ai_messages.append({"role": "assistant", "content": reply, "error": not ok})
+                context = build_ai_context(code_input, analysis)
+                with st.chat_message("assistant"):
+                    reply, ok = run_tutor(history, question, context)
+                st.session_state.ai_messages.append({"role": "assistant", "content": reply, "error": not ok})
