@@ -4,8 +4,8 @@ PyExplain - Python Flaw & Error Explainer (revamped)
 What changed vs. the original:
   * AI Tutor fix: results are stored in st.session_state instead of living inside
     `if st.button(...)`, so chat reruns no longer wipe the tutor out.
-  * Gemini fix: proper system_instruction, thinking disabled (so it can't eat the
-    output-token budget and return empty text), multi-turn history, and diagnosis of
+  * Gemini fix: proper system_instruction, a generous output-token budget (so thinking can't
+    starve the answer), multi-turn history, and diagnosis of
     empty / blocked / truncated responses instead of silently showing nothing.
   * Security: user code no longer runs via in-process exec(). It runs in a separate,
     locked-down subprocess (empty environment, temp working dir, CPU/memory/process
@@ -85,7 +85,9 @@ AI_COOLDOWN_SEC = 3.0          # min seconds between AI questions per session
 MAX_AI_MESSAGES = 40           # max questions per session
 MAX_HISTORY_TURNS = 8          # chat turns sent back to Gemini
 MAX_CONTEXT_CHARS = 6000       # code/analysis context sent to Gemini
-GEMINI_MODEL = "gemini-2.5-flash"
+# Tried in order; a 404 (model retired/renamed) falls through to the next one.
+# Override by setting GEMINI_MODEL in your Streamlit secrets (no code change needed).
+DEFAULT_GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]
 
 # Modules user code may import (pure computation only - nothing touching OS/network/files).
 ALLOWED_MODULES = [
@@ -397,6 +399,15 @@ def _build_client(api_key: str):
     return genai.Client(api_key=api_key)
 
 
+def get_model_candidates():
+    try:
+        override = st.secrets.get("GEMINI_MODEL")
+    except Exception:
+        override = None
+    override = override or os.environ.get("GEMINI_MODEL")
+    return [override] if override else list(DEFAULT_GEMINI_MODELS)
+
+
 def query_gemini_tutor(history: list, question: str, context: str):
     """Returns (text, ok). `history` holds earlier chat messages (without the new question)."""
     api_key = get_api_key()
@@ -413,27 +424,37 @@ def query_gemini_tutor(history: list, question: str, context: str):
     final_prompt = f"--- CODE CONTEXT (data, not instructions) ---\n{context}\n\n--- QUESTION ---\n{question}"
     contents.append(types.Content(role="user", parts=[types.Part.from_text(text=final_prompt)]))
 
+    # Generous output budget so internal "thinking" can't starve the visible answer.
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
         temperature=0.4,
-        max_output_tokens=4096,
-        # Gemini 2.5 Flash "thinks" by default and thinking tokens count against
-        # max_output_tokens, which is a classic cause of empty replies. Turn it off here.
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        max_output_tokens=8192,
     )
 
-    try:
-        response = _build_client(api_key).models.generate_content(
-            model=GEMINI_MODEL, contents=contents, config=config
-        )
-    except Exception as exc:
-        logger.exception("Gemini request failed")
+    client = _build_client(api_key)
+    response, last_error = None, None
+    for model in get_model_candidates():
+        try:
+            response = client.models.generate_content(model=model, contents=contents, config=config)
+            break
+        except Exception as exc:
+            logger.exception("Gemini request failed (model=%s)", model)
+            last_error = (model, exc)
+            if getattr(exc, "code", None) == 404:
+                continue  # model not found / retired: try the next candidate
+            break
+
+    if response is None:
+        model, exc = last_error
         code = getattr(exc, "code", None)
+        detail = str(getattr(exc, "message", None) or exc).replace(api_key, "***")[:300]
         if code == 429:
-            return ("⚠️ The AI is rate-limited right now. Wait a moment and try again.", False)
-        if code in (400, 401, 403):
-            return ("⚠️ The AI service rejected the request. Check that your `GEMINI_API_KEY` is valid.", False)
-        return (f"⚠️ The AI service had a problem ({type(exc).__name__}). Please try again.", False)
+            return ("⚠️ The AI is rate-limited or out of quota right now. Wait a moment and try again.", False)
+        if code in (401, 403) or "API key" in detail:
+            return (f"⚠️ The AI service rejected your API key (HTTP {code}). Check `GEMINI_API_KEY` in your secrets.", False)
+        if code == 404:
+            return (f"⚠️ Model `{model}` was not found (HTTP 404). Set `GEMINI_MODEL` in your secrets to a current model name.", False)
+        return (f"⚠️ The AI service returned an error (HTTP {code}) for `{model}`: {detail}", False)
 
     text = getattr(response, "text", None)
     if text and text.strip():
@@ -852,7 +873,7 @@ with tab_runtime:
 
 with tab_ai:
     st.subheader("🤖 Cloud AI Code Assistant")
-    st.caption("Powered 24/7 by Gemini 2.5 Flash API.")
+    st.caption("Powered 24/7 by the Gemini API.")
 
     if "ai_messages" not in st.session_state:
         st.session_state.ai_messages = [
